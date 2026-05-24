@@ -40,7 +40,9 @@ DRAFT_TTL_SECONDS = 60 * 60  # 1 hour
 def _gc_drafts():
     cutoff = time.time() - DRAFT_TTL_SECONDS
     for k in [k for k, v in DRAFTS.items() if v["created_at"] < cutoff]:
-        DRAFTS.pop(k, None)
+        d = DRAFTS.pop(k, None)
+        if d:
+            anki_gen.cleanup_content(d.get("content"))
 
 
 def _image_data_url(img):
@@ -95,7 +97,30 @@ INDEX_HTML = r"""<!doctype html>
   }
   main { width: 100%; max-width: 760px; }
   h1 { font-size: 28px; font-weight: 600; margin: 0 0 8px; }
-  .subtitle { color: var(--muted); margin: 0 0 32px; font-size: 15px; }
+  .subtitle { color: var(--muted); margin: 0; font-size: 15px; }
+
+  .header-row {
+    display: flex;
+    justify-content: space-between;
+    align-items: flex-start;
+    gap: 24px;
+    margin-bottom: 32px;
+  }
+  .model-picker { display: flex; flex-direction: column; min-width: 180px; }
+  .model-picker select {
+    padding: 10px 12px;
+    background: #0f1219;
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    color: var(--text);
+    font-size: 14px;
+    font-family: inherit;
+    cursor: pointer;
+  }
+  .model-picker select:focus { outline: none; border-color: var(--accent); }
+
+  /* HTML5 datalist styling is browser-dependent; the input is the same */
+  datalist { display: none; }
   h2 { font-size: 16px; font-weight: 600; margin: 28px 0 12px; color: var(--muted); text-transform: uppercase; letter-spacing: 0.04em; }
 
   .panel {
@@ -150,6 +175,36 @@ INDEX_HTML = r"""<!doctype html>
   button.ghost:hover:not(:disabled) { background: var(--panel-2); color: var(--text); }
   button.danger { background: transparent; color: var(--danger); border: 1px solid transparent; padding: 4px 8px; font-size: 13px; }
   button.danger:hover:not(:disabled) { background: rgba(255,123,123,0.1); }
+  button.small {
+    background: transparent;
+    color: var(--muted);
+    border: 1px solid var(--border);
+    padding: 4px 10px;
+    font-size: 12px;
+    font-weight: 500;
+  }
+  button.small:hover:not(:disabled) { background: var(--panel-2); color: var(--text); border-color: var(--accent); }
+  button.primary-small {
+    background: var(--accent);
+    color: #0a0d14;
+    padding: 4px 10px;
+    font-size: 12px;
+  }
+
+  textarea.edit-field {
+    width: 100%;
+    padding: 8px 10px;
+    background: #0f1219;
+    border: 1px solid var(--accent);
+    border-radius: 6px;
+    color: var(--text);
+    font-size: 14px;
+    font-family: inherit;
+    resize: vertical;
+    min-height: 50px;
+    margin: 4px 0;
+  }
+  textarea.edit-field:focus { outline: none; }
 
   #status, #commit-status { margin-top: 20px; font-size: 14px; min-height: 20px; }
   .status-working { color: var(--muted); }
@@ -187,6 +242,38 @@ INDEX_HTML = r"""<!doctype html>
     background: #0a0d14;
     object-fit: contain;
     display: block;
+  }
+  .image-edit-wrap {
+    position: relative;
+    display: inline-block;
+    margin: 8px 0;
+  }
+  .image-edit-wrap .card-image { margin: 0; }
+  .image-remove-btn {
+    position: absolute;
+    top: 6px;
+    right: 6px;
+    width: 24px;
+    height: 24px;
+    padding: 0;
+    border-radius: 50%;
+    background: rgba(0, 0, 0, 0.75);
+    color: white;
+    border: 1px solid rgba(255, 255, 255, 0.2);
+    font-size: 14px;
+    line-height: 1;
+    cursor: pointer;
+    font-weight: 600;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+  }
+  .image-remove-btn:hover { background: var(--danger); color: white; border-color: var(--danger); }
+  .paste-hint {
+    color: var(--muted);
+    font-size: 12px;
+    font-style: italic;
+    margin: 4px 0 8px;
   }
 
   .badge {
@@ -247,12 +334,45 @@ INDEX_HTML = r"""<!doctype html>
     border-radius: 6px;
   }
   .source-info strong { color: var(--text); }
+  .warnings {
+    margin-bottom: 16px;
+    padding: 12px 14px;
+    background: rgba(255, 200, 100, 0.08);
+    border: 1px solid rgba(255, 200, 100, 0.3);
+    border-radius: 8px;
+    color: #f0c89c;
+    font-size: 13px;
+    line-height: 1.5;
+  }
+  .warnings strong { color: #ffb84d; }
+  .warnings ul { margin: 6px 0 0 0; padding-left: 20px; }
+  .warnings li { margin: 4px 0; }
+
+  .enriched-flash {
+    margin: 8px 0;
+    padding: 6px 10px;
+    background: rgba(111, 210, 154, 0.1);
+    border-left: 3px solid var(--success);
+    border-radius: 4px;
+    color: var(--success);
+    font-size: 12px;
+    font-style: italic;
+    line-height: 1.4;
+  }
 </style>
 </head>
 <body>
 <main>
-  <h1>Anki Generator</h1>
-  <p class="subtitle">Paste a link. We extract figures + text, then build cards from the visuals.</p>
+  <div class="header-row">
+    <div>
+      <h1>Anki Generator</h1>
+      <p class="subtitle">Paste a link. We extract figures + text, then build cards from the visuals.</p>
+    </div>
+    <div class="model-picker">
+      <label for="model-select" style="margin-bottom: 4px;">Model</label>
+      <select id="model-select"></select>
+    </div>
+  </div>
 
   <!-- Phase 1: URL form -->
   <div id="phase-input" class="panel">
@@ -278,8 +398,6 @@ INDEX_HTML = r"""<!doctype html>
       </div>
     </div>
 
-    <label for="deck" style="margin-top: 16px;">Deck name</label>
-    <input type="text" id="deck" value="AI Generated">
     <button id="generate-btn" class="full" style="margin-top: 20px;">Generate cards</button>
     <div id="status"></div>
   </div>
@@ -287,6 +405,7 @@ INDEX_HTML = r"""<!doctype html>
   <!-- Phase 2: Review -->
   <div id="phase-review" class="hidden">
     <div id="source-info" class="source-info"></div>
+    <div id="warnings-box"></div>
     <div id="figures-strip"></div>
 
     <h2>Review cards <span id="card-count" class="text-muted" style="text-transform:none; font-weight:400;"></span></h2>
@@ -300,6 +419,25 @@ INDEX_HTML = r"""<!doctype html>
              placeholder="Start typing — e.g. 'spacing effect', 'why retrieval works'…">
       <div id="suggest-status" style="font-size:13px; color:var(--muted); margin-top:10px; min-height:18px;"></div>
       <div id="suggestions" style="margin-top: 12px;"></div>
+    </div>
+
+    <h2>Save</h2>
+    <div class="panel" style="display: flex; flex-direction: column; gap: 8px;">
+      <label for="deck-review">Deck name <span style="text-transform: none; font-weight: 400; color: var(--muted);">(suggested from source — edit if you want)</span></label>
+      <!-- autocomplete=new-password + unusual name + data-form-type=other defeats
+           Chrome/Safari's heuristic autofill, which ignores autocomplete=off. -->
+      <input type="text"
+             id="deck-review"
+             list="decks-list"
+             name="ankigen-deck-name-xyz"
+             autocomplete="new-password"
+             autocorrect="off"
+             autocapitalize="off"
+             spellcheck="false"
+             data-lpignore="true"
+             data-form-type="other"
+             placeholder="(suggestion will appear here)">
+      <datalist id="decks-list"></datalist>
     </div>
 
     <div class="footer-actions">
@@ -318,10 +456,49 @@ let state = {
   draftId: null,
   deck: 'AI Generated',
   sourceKind: 'web',
-  cards: [],        // {type, ..., image_ref, _source}
-  suggestions: [],  // candidate cards from /suggest
-  images: [],       // [{data_url, caption, source_kind}]
+  model: localStorage.getItem('anki_gen_model') || 'claude-opus-4-5',
+  cards: [],          // {type, ..., image_ref, _source, _editing?, _rerolling?, _enriching?}
+  suggestions: [],    // candidate cards from /suggest
+  images: [],         // [{data_url, caption, source_kind}]
+  warnings: [],
 };
+
+// ── One-shot bootstrap: load models + decks ──────────────────────────────────
+async function loadModels() {
+  try {
+    const r = await fetch('/models');
+    const data = await r.json();
+    const sel = $('model-select');
+    sel.innerHTML = '';
+    data.models.forEach(m => {
+      const opt = document.createElement('option');
+      opt.value = m.id;
+      opt.textContent = `${m.label} — ${m.tier}`;
+      sel.appendChild(opt);
+    });
+    sel.value = state.model;
+    sel.addEventListener('change', () => {
+      state.model = sel.value;
+      localStorage.setItem('anki_gen_model', state.model);
+    });
+  } catch (e) { /* model picker is optional */ }
+}
+
+async function loadDecks() {
+  try {
+    const r = await fetch('/decks');
+    const data = await r.json();
+    const list = $('decks-list');
+    list.innerHTML = '';
+    (data.decks || []).forEach(name => {
+      const opt = document.createElement('option');
+      opt.value = name;
+      list.appendChild(opt);
+    });
+  } catch (e) { /* deck picker is optional; falls back to plain text input */ }
+}
+loadModels();
+loadDecks();
 
 // ── Helpers ──────────────────────────────────────────────────────────────────
 function setStatus(elId, html, cls) {
@@ -347,16 +524,19 @@ function cardImageHTML(card) {
   return `<img class="card-image" src="${img.data_url}" alt="${escapeHtml(img.caption || '')}">`;
 }
 
-function cardHTML(card) {
+function cardDisplayHTML(card) {
   const sourceBadge = card._source === 'manual'
     ? '<span class="badge manual">Manual</span>' : '';
   const figureBadge = (card.image_ref !== null && card.image_ref !== undefined)
     ? `<span class="badge figure">Fig ${card.image_ref}</span>` : '';
+  const enrichedFlash = card._enriched_msg
+    ? `<div class="enriched-flash">✓ ${escapeHtml(card._enriched_msg)}</div>` : '';
   if ((card.type || 'basic') === 'cloze') {
     return `
       ${sourceBadge}
       <span class="badge cloze">Cloze</span>
       ${figureBadge}
+      ${enrichedFlash}
       ${cardImageHTML(card)}
       <div class="label-line">Text</div>
       <div class="text-line">${renderClozeText(escapeHtml(card.text || ''))}</div>
@@ -367,6 +547,7 @@ function cardHTML(card) {
     ${sourceBadge}
     <span class="badge basic">Basic</span>
     ${figureBadge}
+    ${enrichedFlash}
     ${cardImageHTML(card)}
     <div class="label-line">Question</div>
     <div class="text-line">${escapeHtml(card.question || '')}</div>
@@ -375,17 +556,90 @@ function cardHTML(card) {
   `;
 }
 
+function cardEditImageHTML(card, idx) {
+  // In edit mode, wrap the image with a removable × button.
+  if (card.image_ref === null || card.image_ref === undefined) return '';
+  const img = state.images[card.image_ref];
+  if (!img) return '';
+  return `
+    <div class="image-edit-wrap">
+      <img class="card-image" src="${img.data_url}" alt="${escapeHtml(img.caption || '')}">
+      <button class="image-remove-btn" data-action="remove-image" data-idx="${idx}" title="Remove image">×</button>
+    </div>
+  `;
+}
+
+function cardEditHTML(card, idx) {
+  const sourceBadge = card._source === 'manual'
+    ? '<span class="badge manual">Manual</span>' : '';
+  const figureBadge = (card.image_ref !== null && card.image_ref !== undefined)
+    ? `<span class="badge figure">Fig ${card.image_ref}</span>` : '';
+  const hasImage = (card.image_ref !== null && card.image_ref !== undefined);
+  const pasteHint = `<div class="paste-hint">💡 ${hasImage ? 'Paste an image (⌘V) below to replace the current one' : 'Paste an image (⌘V) anywhere below to attach one to this card'}</div>`;
+  if ((card.type || 'basic') === 'cloze') {
+    return `
+      ${sourceBadge}
+      <span class="badge cloze">Cloze</span>
+      ${figureBadge}
+      ${cardEditImageHTML(card, idx)}
+      ${pasteHint}
+      <div class="label-line">Text (use {{c1::word}} for cloze deletions)</div>
+      <textarea class="edit-field" data-field="text" data-idx="${idx}">${escapeHtml(card.text || '')}</textarea>
+      <div class="label-line">Back Extra (optional)</div>
+      <textarea class="edit-field" data-field="extra" data-idx="${idx}">${escapeHtml(card.extra || '')}</textarea>
+    `;
+  }
+  return `
+    ${sourceBadge}
+    <span class="badge basic">Basic</span>
+    ${figureBadge}
+    ${cardEditImageHTML(card, idx)}
+    ${pasteHint}
+    <div class="label-line">Question</div>
+    <textarea class="edit-field" data-field="question" data-idx="${idx}">${escapeHtml(card.question || '')}</textarea>
+    <div class="label-line">Answer</div>
+    <textarea class="edit-field" data-field="answer" data-idx="${idx}">${escapeHtml(card.answer || '')}</textarea>
+  `;
+}
+
+function cardActionsHTML(card, idx) {
+  if (card._rerolling) {
+    return `<div style="color: var(--muted); font-size: 12px;"><span class="spinner"></span>Re-rolling…</div>`;
+  }
+  if (card._enriching) {
+    return `<div style="color: var(--muted); font-size: 12px;"><span class="spinner"></span>Enriching…</div>`;
+  }
+  if (card._editing) {
+    return `
+      <button class="primary-small" data-action="save-edit" data-idx="${idx}">Save</button>
+      <button class="small" data-action="cancel-edit" data-idx="${idx}">Cancel</button>
+    `;
+  }
+  return `
+    <button class="small" data-action="edit" data-idx="${idx}">Edit</button>
+    <button class="small" data-action="reroll" data-idx="${idx}">↻ Re-roll</button>
+    <button class="small" data-action="enrich" data-idx="${idx}" title="Hunt for a visual that matches this card">✨ Enrich</button>
+    <button class="danger" data-action="remove" data-idx="${idx}">Remove</button>
+  `;
+}
+
+function renderWarnings() {
+  const box = $('warnings-box');
+  if (!state.warnings || !state.warnings.length) { box.innerHTML = ''; return; }
+  const items = state.warnings.map(w => `<li>${escapeHtml(w)}</li>`).join('');
+  box.innerHTML = `<div class="warnings"><strong>Visuals are core to good cards — but extraction had issues:</strong><ul>${items}</ul>Tip: click <strong>✨ Enrich</strong> on any card to actively hunt for a relevant visual.</div>`;
+}
+
 function renderCards() {
   const list = $('cards-list');
   list.innerHTML = '';
   state.cards.forEach((card, idx) => {
     const div = document.createElement('div');
     div.className = 'card';
+    const body = card._editing ? cardEditHTML(card, idx) : cardDisplayHTML(card);
     div.innerHTML = `
-      <div class="card-body">${cardHTML(card)}</div>
-      <div class="card-actions">
-        <button class="danger" data-action="remove" data-idx="${idx}">Remove</button>
-      </div>
+      <div class="card-body">${body}</div>
+      <div class="card-actions">${cardActionsHTML(card, idx)}</div>
     `;
     list.appendChild(div);
   });
@@ -400,7 +654,7 @@ function renderSuggestions() {
     const div = document.createElement('div');
     div.className = 'card suggestion';
     div.innerHTML = `
-      <div class="card-body">${cardHTML(card)}</div>
+      <div class="card-body">${cardDisplayHTML(card)}</div>
       <div class="card-actions">
         <button data-action="add-suggestion" data-idx="${idx}">+ Add</button>
       </div>
@@ -465,7 +719,9 @@ $('switch-to-url').addEventListener('click', (e) => {
 
 // ── Event handlers ───────────────────────────────────────────────────────────
 $('generate-btn').addEventListener('click', async () => {
-  const deck = $('deck').value.trim() || 'AI Generated';
+  // The deck name is now chosen AFTER generation, on the review panel.
+  // Send a placeholder; the real deck will be set at /commit time.
+  const deck = 'AI Generated';
   let request;
   let etaLabel;
 
@@ -476,6 +732,7 @@ $('generate-btn').addEventListener('click', async () => {
     const form = new FormData();
     form.append('file', file);
     form.append('deck', deck);
+    form.append('model', state.model);
     request = { method: 'POST', body: form };  // no Content-Type, browser sets boundary
     etaLabel = `${Math.ceil(file.size / 1e6)} MB PDF · 30–90s`;
   } else {
@@ -486,7 +743,7 @@ $('generate-btn').addEventListener('click', async () => {
     request = {
       method: 'POST',
       headers: {'Content-Type': 'application/json'},
-      body: JSON.stringify({url, deck}),
+      body: JSON.stringify({url, deck, model: state.model}),
     };
   }
 
@@ -504,13 +761,28 @@ $('generate-btn').addEventListener('click', async () => {
       return;
     }
     state.draftId = data.draft_id;
-    state.deck = data.deck;
+    state.deck = data.suggested_deck || data.deck || 'AI Generated';
     state.sourceKind = data.source_kind || 'web';
     state.images = data.images || [];
+    state.warnings = data.warnings || [];
     state.cards = (data.cards || []).map(c => ({...c, _source: 'auto'}));
+    console.log('[ankigen] /draft returned suggested_deck =', JSON.stringify(data.suggested_deck),
+                ' | state.deck =', JSON.stringify(state.deck));
     $('phase-input').classList.add('hidden');
     $('phase-review').classList.remove('hidden');
+    // Set the deck input value AFTER the panel is visible. Doing it before
+    // can race with browser form autofill on some browsers. Also re-set
+    // after a microtask + a small timeout to defeat late autofill writes.
+    const setDeck = () => {
+      const el = $('deck-review');
+      el.value = state.deck;
+      console.log('[ankigen] deck-review.value set to:', JSON.stringify(el.value));
+    };
+    setDeck();
+    requestAnimationFrame(setDeck);
+    setTimeout(setDeck, 250);
     renderFigureStrip();
+    renderWarnings();
     renderCards();
     renderSourceInfo();
     setStatus('status', '', '');
@@ -538,8 +810,166 @@ document.addEventListener('click', (e) => {
     renderCards();
     renderSuggestions();
     renderSourceInfo();
+  } else if (action === 'edit') {
+    state.cards[idx]._editing = true;
+    state.cards[idx]._editBackup = {
+      question:  state.cards[idx].question,
+      answer:    state.cards[idx].answer,
+      text:      state.cards[idx].text,
+      extra:     state.cards[idx].extra,
+      image_ref: state.cards[idx].image_ref,
+    };
+    renderCards();
+  } else if (action === 'cancel-edit') {
+    const c = state.cards[idx];
+    if (c._editBackup) Object.assign(c, c._editBackup);
+    delete c._editing;
+    delete c._editBackup;
+    renderCards();
+  } else if (action === 'save-edit') {
+    // Pull all textarea values for this card into state.cards[idx]
+    document.querySelectorAll(`textarea.edit-field[data-idx="${idx}"]`).forEach(t => {
+      state.cards[idx][t.dataset.field] = t.value;
+    });
+    delete state.cards[idx]._editing;
+    delete state.cards[idx]._editBackup;
+    renderCards();
+  } else if (action === 'reroll') {
+    rerollCard(idx);
+  } else if (action === 'enrich') {
+    enrichCard(idx);
+  } else if (action === 'remove-image') {
+    state.cards[idx].image_ref = null;
+    renderCards();
   }
 });
+
+// ── Paste-to-attach-image: works on textareas inside an editing card ─────────
+document.addEventListener('paste', async (e) => {
+  const target = e.target;
+  if (!(target instanceof HTMLTextAreaElement) || !target.classList.contains('edit-field')) {
+    return;  // not in our edit textarea
+  }
+  const items = e.clipboardData ? e.clipboardData.items : null;
+  if (!items) return;
+  for (const item of items) {
+    if (item.type && item.type.startsWith('image/')) {
+      e.preventDefault();  // stop the text-paste behaviour
+      const blob = item.getAsFile();
+      if (!blob) return;
+      const idx = parseInt(target.dataset.idx, 10);
+      await uploadPastedImage(blob, idx);
+      return;
+    }
+  }
+});
+
+async function uploadPastedImage(blob, cardIdx) {
+  const form = new FormData();
+  form.append('file', blob, 'pasted.' + (blob.type.split('/')[1] || 'png'));
+  form.append('draft_id', state.draftId);
+  try {
+    const r = await fetch('/upload_image', { method: 'POST', body: form });
+    const data = await r.json();
+    if (!r.ok || data.error) {
+      alert('Image upload failed: ' + (data.error || 'Unknown error'));
+      return;
+    }
+    state.images.push(data.image);
+    if (state.cards[cardIdx]) {
+      state.cards[cardIdx].image_ref = data.image_index;
+    }
+    renderFigureStrip();
+    renderCards();  // re-renders the edit form with the new image attached
+  } catch (e) {
+    alert('Network error: ' + e.message);
+  }
+}
+
+async function enrichCard(idx) {
+  const card = state.cards[idx];
+  if (!card) return;
+  state.cards[idx]._enriching = true;
+  renderCards();
+  try {
+    const r = await fetch('/enrich', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({
+        draft_id: state.draftId,
+        model: state.model,
+        card: stripInternal(card),
+      }),
+    });
+    const data = await r.json();
+    delete state.cards[idx]._enriching;
+
+    // Failure: clear error alert
+    if (!r.ok || data.error || !data.card) {
+      alert('Enrich failed: ' + (data.error || data.message || 'Unknown error'));
+      renderCards();
+      return;
+    }
+
+    // Success: silently update the card. The new image + caption tell the
+    // story; no alert popup. We do flash a brief status note inline.
+    if (data.new_image) state.images.push(data.new_image);
+    state.cards[idx] = {...data.card, _source: card._source || 'auto', _enriched_msg: data.message};
+    renderFigureStrip();
+    renderCards();
+    renderSourceInfo();
+    // Auto-clear the status flash after a few seconds
+    setTimeout(() => {
+      if (state.cards[idx]) {
+        delete state.cards[idx]._enriched_msg;
+        renderCards();
+      }
+    }, 6000);
+  } catch (e) {
+    delete state.cards[idx]._enriching;
+    alert('Network error: ' + e.message);
+    renderCards();
+  }
+}
+
+async function rerollCard(idx) {
+  const original = state.cards[idx];
+  if (!original) return;
+  state.cards[idx]._rerolling = true;
+  renderCards();
+  try {
+    const r = await fetch('/reroll', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({
+        draft_id: state.draftId,
+        model: state.model,
+        // Strip our internal flags before sending
+        card: stripInternal(original),
+        other_cards: state.cards.filter((_, i) => i !== idx).map(stripInternal),
+      }),
+    });
+    const data = await r.json();
+    if (!r.ok || data.error || !data.card) {
+      alert('Re-roll failed: ' + (data.error || 'Unknown error'));
+      delete state.cards[idx]._rerolling;
+      renderCards();
+      return;
+    }
+    // Preserve the _source tag from the original (manual stays manual, etc.)
+    state.cards[idx] = {...data.card, _source: original._source || 'auto'};
+  } catch (e) {
+    alert('Network error: ' + e.message);
+    delete state.cards[idx]._rerolling;
+  }
+  renderCards();
+  renderSourceInfo();
+}
+
+function stripInternal(card) {
+  const { _source, _editing, _editBackup, _rerolling, _enriching, _enriched_msg, ...rest } = card;
+  return rest;
+}
 
 let suggestTimer = null;
 let suggestSeq = 0;
@@ -564,8 +994,9 @@ async function fetchSuggestions(concept) {
       headers: {'Content-Type': 'application/json'},
       body: JSON.stringify({
         draft_id: state.draftId,
+        model: state.model,
         concept,
-        existing_cards: state.cards,
+        existing_cards: state.cards.map(stripInternal),
       }),
     });
     const data = await r.json();
@@ -593,6 +1024,9 @@ $('commit-btn').addEventListener('click', async () => {
     setStatus('commit-status', 'No cards to save.', 'error');
     return;
   }
+  // Re-read the deck name in case the user edited it
+  const deckChosen = $('deck-review').value.trim() || 'AI Generated';
+  state.deck = deckChosen;
   $('commit-btn').disabled = true;
   setStatus('commit-status', '<span class="spinner"></span>Saving cards and figures to Anki…', 'working');
   try {
@@ -601,8 +1035,8 @@ $('commit-btn').addEventListener('click', async () => {
       headers: {'Content-Type': 'application/json'},
       body: JSON.stringify({
         draft_id: state.draftId,
-        deck: state.deck,
-        cards: state.cards.map(({_source, ...rest}) => rest),
+        deck: deckChosen,
+        cards: state.cards.map(stripInternal),
       }),
     });
     const data = await r.json();
@@ -628,14 +1062,21 @@ $('discard-btn').addEventListener('click', () => {
 });
 
 function resetToInput() {
-  state = { draftId: null, deck: 'AI Generated', sourceKind: 'web',
-            cards: [], suggestions: [], images: [] };
+  state = {
+    draftId: null,
+    deck: 'AI Generated',
+    sourceKind: 'web',
+    model: $('model-select').value || localStorage.getItem('anki_gen_model') || 'claude-opus-4-5',
+    cards: [], suggestions: [], images: [], warnings: [],
+  };
   $('phase-review').classList.add('hidden');
   $('phase-input').classList.remove('hidden');
   $('url').value = '';
   $('concept').value = '';
+  $('deck-review').value = '';
   $('suggestions').innerHTML = '';
   $('figures-strip').innerHTML = '';
+  $('warnings-box').innerHTML = '';
   $('suggest-status').textContent = '';
   setStatus('status', '', '');
   setStatus('commit-status', '', '');
@@ -656,6 +1097,29 @@ def index():
     return Response(INDEX_HTML, mimetype="text/html")
 
 
+@app.route("/decks", methods=["GET"])
+def decks():
+    """Return the user's existing Anki decks for the deck-picker dropdown."""
+    try:
+        names = anki_gen.anki_request("deckNames")
+    except Exception as e:
+        return jsonify({"decks": [], "error": str(e)})
+    # Skip the Default deck (Anki includes it but most users don't want it as the target)
+    return jsonify({"decks": sorted(n for n in names if n != "Default")})
+
+
+@app.route("/models", methods=["GET"])
+def models():
+    """Return the available Claude models for the model-picker dropdown."""
+    return jsonify({
+        "models": [
+            {"id": name, **info}
+            for name, info in anki_gen.AVAILABLE_MODELS.items()
+        ],
+        "default": anki_gen.DEFAULT_MODEL,
+    })
+
+
 @app.route("/draft", methods=["POST"])
 def draft():
     """Generate cards from either a URL (JSON) or an uploaded PDF (multipart)."""
@@ -665,6 +1129,7 @@ def draft():
         if not f or not f.filename:
             return jsonify({"error": "No file uploaded."}), 400
         deck = anki_gen.normalize_deck_name(request.form.get("deck"))
+        model = anki_gen.resolve_model(request.form.get("model"))
         try:
             pdf_bytes = f.read()
             content = anki_gen.fetch_pdf_from_bytes(pdf_bytes, source_label=f.filename)
@@ -672,13 +1137,14 @@ def draft():
             return jsonify({"error": str(e)}), 400
         source_kind = "pdf"
         url = f"file://{f.filename}"
-        return _finish_draft(content, source_kind, url, deck)
+        return _finish_draft(content, source_kind, url, deck, model)
 
-    # ── URL branch (existing) ─────────────────────────────────────────────────
+    # ── URL branch ────────────────────────────────────────────────────────────
     data = request.get_json(silent=True) or {}
     raw_url = data.get("url")
     url = (raw_url if isinstance(raw_url, str) else "").strip()
     deck = anki_gen.normalize_deck_name(data.get("deck"))
+    model = anki_gen.resolve_model(data.get("model"))
 
     if not url:
         return jsonify({"error": "URL is required"}), 400
@@ -687,10 +1153,10 @@ def draft():
         content, source_kind = anki_gen.fetch_content(url)
     except Exception as e:
         return jsonify({"error": str(e)}), 500
-    return _finish_draft(content, source_kind, url, deck)
+    return _finish_draft(content, source_kind, url, deck, model)
 
 
-def _finish_draft(content, source_kind, url, deck):
+def _finish_draft(content, source_kind, url, deck, model):
     """Shared post-fetch logic: validate content, generate cards, store draft."""
     n_chars = len(content.get("text", "").strip())
     n_imgs = len(content.get("images", []))
@@ -707,7 +1173,9 @@ def _finish_draft(content, source_kind, url, deck):
 
     try:
         guidelines = anki_gen.load_guidelines()
-        cards = anki_gen.generate_cards(content, url, guidelines, source_kind=source_kind)
+        cards = anki_gen.generate_cards(
+            content, url, guidelines, source_kind=source_kind, model=model,
+        )
     except Exception as e:
         return jsonify({"error": f"Card generation failed: {e}"}), 500
 
@@ -728,14 +1196,18 @@ def _finish_draft(content, source_kind, url, deck):
         "deck": deck,
         "guidelines": guidelines,
         "source_kind": source_kind,
+        "model": model,
         "created_at": time.time(),
     }
     return jsonify({
         "draft_id": draft_id,
         "deck": deck,
+        "suggested_deck": anki_gen.normalize_deck_name(content.get("title"), default=""),
         "source_kind": source_kind,
+        "model": model,
         "cards": cards,
         "images": _public_image_payload(content.get("images", [])),
+        "warnings": content.get("warnings", []),
     })
 
 
@@ -756,14 +1228,49 @@ def suggest():
     n_images = len(d["content"].get("images", []))
     # Filter malformed entries (None / non-dict) before passing to Claude
     existing = anki_gen.validate_cards(data.get("existing_cards") or [], n_images=n_images)
+    model = anki_gen.resolve_model(data.get("model") or d.get("model"))
     try:
         suggestions = anki_gen.suggest_cards(
             d["content"], d["url"], d["guidelines"], concept, existing,
-            source_kind=d.get("source_kind", "web"),
+            source_kind=d.get("source_kind", "web"), model=model,
         )
         return jsonify({"suggestions": suggestions})
     except Exception as e:
         return jsonify({"error": str(e)}), 500
+
+
+@app.route("/reroll", methods=["POST"])
+def reroll():
+    """Generate a single replacement card on the same concept as the original."""
+    data = request.get_json(silent=True) or {}
+    draft_id = data.get("draft_id")
+    original = data.get("card")
+    other_cards = data.get("other_cards") or []
+
+    if not draft_id or draft_id not in DRAFTS:
+        return jsonify({"error": "Draft expired. Please start over."}), 400
+    if not isinstance(original, dict):
+        return jsonify({"error": "No valid card to re-roll."}), 400
+
+    d = DRAFTS[draft_id]
+    n_images = len(d["content"].get("images", []))
+    original = anki_gen.validate_card(original, n_images=n_images)
+    other_cards = anki_gen.validate_cards(other_cards, n_images=n_images)
+    if original is None:
+        return jsonify({"error": "Original card is malformed."}), 400
+
+    model = anki_gen.resolve_model(data.get("model") or d.get("model"))
+    try:
+        new_card = anki_gen.reroll_card(
+            d["content"], d["url"], d["guidelines"],
+            original, other_cards,
+            source_kind=d.get("source_kind", "web"), model=model,
+        )
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+    if new_card is None:
+        return jsonify({"error": "Claude returned an unusable card."}), 500
+    return jsonify({"card": new_card})
 
 
 @app.route("/commit", methods=["POST"])
@@ -797,10 +1304,116 @@ def commit():
 
     try:
         added, skipped = anki_gen.add_cards_to_anki(cards, deck, images=images)
+        # Clean up any cached video tmpdir for this draft
+        anki_gen.cleanup_content(d.get("content"))
         DRAFTS.pop(draft_id, None)
         return jsonify({"added": added, "skipped": skipped, "deck": deck})
     except Exception as e:
         return jsonify({"error": str(e)}), 500
+
+
+@app.route("/upload_image", methods=["POST"])
+def upload_image():
+    """Accept a user-pasted/uploaded image and attach it to a draft.
+
+    Returns the new image index so the calling card can reference it via
+    `image_ref`, plus a data-URL preview for in-browser rendering.
+    """
+    draft_id = request.form.get("draft_id")
+    if not draft_id or draft_id not in DRAFTS:
+        return jsonify({"error": "Draft expired. Please start over."}), 400
+    if "file" not in request.files:
+        return jsonify({"error": "No image uploaded."}), 400
+
+    f = request.files["file"]
+    raw = f.read()
+    if not raw:
+        return jsonify({"error": "Uploaded image is empty."}), 400
+
+    # Detect mime from magic bytes (clipboard pastes don't always set Content-Type)
+    if raw[:8] == b"\x89PNG\r\n\x1a\n":
+        mime = "image/png"
+    elif raw[:3] == b"\xff\xd8\xff":
+        mime = "image/jpeg"
+    elif raw[:6] in (b"GIF87a", b"GIF89a"):
+        mime = "image/gif"
+    elif raw[:4] == b"RIFF" and raw[8:12] == b"WEBP":
+        mime = "image/webp"
+    else:
+        mime = (f.mimetype or "image/png").lower()
+        if not mime.startswith("image/"):
+            return jsonify({"error": f"Unsupported file type ({mime})."}), 400
+
+    # Skip the small-image filter — the user explicitly chose this image.
+    normalized = anki_gen._normalize_image(raw, mime, min_dim=None)
+    if not normalized:
+        return jsonify({"error": "Could not decode that image."}), 400
+
+    data, out_mime, ext = normalized
+    new_image = {
+        "data": data, "mime": out_mime, "ext": ext,
+        "caption": "(user-attached)",
+        "source_url": "",
+        "source_kind": "user",
+    }
+
+    d = DRAFTS[draft_id]
+    images = d["content"].get("images", [])
+    images.append(new_image)
+    d["content"]["images"] = images
+    new_idx = len(images) - 1
+
+    return jsonify({
+        "image_index": new_idx,
+        "image": {
+            "data_url": _image_data_url(new_image),
+            "caption": new_image["caption"],
+            "source_kind": new_image["source_kind"],
+        },
+    })
+
+
+@app.route("/enrich", methods=["POST"])
+def enrich():
+    """Actively hunt for a visual that matches one specific card."""
+    data = request.get_json(silent=True) or {}
+    draft_id = data.get("draft_id")
+    card = data.get("card")
+
+    if not draft_id or draft_id not in DRAFTS:
+        return jsonify({"error": "Draft expired. Please start over."}), 400
+    if not isinstance(card, dict):
+        return jsonify({"error": "No card provided."}), 400
+
+    d = DRAFTS[draft_id]
+    content = d["content"]
+    n_images = len(content.get("images", []))
+    card = anki_gen.validate_card(card, n_images=n_images)
+    if card is None:
+        return jsonify({"error": "Card is malformed."}), 400
+
+    model = anki_gen.resolve_model(data.get("model") or d.get("model"))
+    try:
+        updated_card, new_image, message = anki_gen.enrich_card_with_visuals(
+            content, card,
+            source_kind=d.get("source_kind", "web"), model=model,
+        )
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+    # If a new image was added to the draft, surface its preview to the browser
+    payload = {"card": updated_card, "message": message}
+    if new_image is not None:
+        payload["new_image"] = {
+            "data_url": _image_data_url(new_image),
+            "caption": new_image.get("caption", ""),
+            "source_kind": new_image.get("source_kind", ""),
+        }
+        payload["image_index"] = updated_card.get("image_ref")
+    elif updated_card.get("image_ref") != card.get("image_ref"):
+        # No new image, but we re-assigned an existing one
+        payload["image_index"] = updated_card.get("image_ref")
+    return jsonify(payload)
 
 
 def open_browser():
