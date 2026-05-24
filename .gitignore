@@ -1,0 +1,35 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+.pytest_cache/
+
+# Virtual environments
+.venv/
+venv/
+env/
+
+# Environment variables (keep API keys out of the repo)
+.env
+.env.local
+
+# Editors / IDEs
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Claude Code session data
+.claude/
+
+# Logs
+*.log
+
+# Temp / cache
+*.tmp
+ankigen_yt_*/
