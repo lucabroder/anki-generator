@@ -26,6 +26,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import time
 from pathlib import Path
 from urllib.parse import urljoin, urlparse, parse_qs
 
@@ -59,6 +60,22 @@ except ImportError:
 
 ANKI_CONNECT_URL = "http://localhost:8765"
 GUIDELINES_FILE = Path(__file__).parent / "flashcard_guidelines.md"
+
+# Available Claude models. Keep in cost order (most expensive first).
+# Each model supports vision so we can use them interchangeably.
+AVAILABLE_MODELS = {
+    "claude-opus-4-5":   {"label": "Opus 4.5",   "tier": "highest quality"},
+    "claude-sonnet-4-5": {"label": "Sonnet 4.5", "tier": "balanced"},
+    "claude-haiku-4-5":  {"label": "Haiku 4.5",  "tier": "fastest & cheapest"},
+}
+DEFAULT_MODEL = "claude-opus-4-5"
+
+
+def resolve_model(name):
+    """Return a known model name, falling back to DEFAULT_MODEL if invalid."""
+    if isinstance(name, str) and name in AVAILABLE_MODELS:
+        return name
+    return DEFAULT_MODEL
 
 MAX_IMAGES_PER_DOC = 12
 MIN_IMAGE_DIM = 200       # skip anything smaller than this on either axis
@@ -243,11 +260,14 @@ def _looks_like_decoration(url):
     return any(s in low for s in IMAGE_BLOCKLIST_SUBSTRINGS)
 
 
-def _normalize_image(data, mime_hint=None):
+def _normalize_image(data, mime_hint=None, min_dim=MIN_IMAGE_DIM):
     """Resize-if-needed and re-encode as JPEG/PNG.
 
     Returns (data: bytes, mime: str, ext: str) or None if image is invalid /
     too small / can't be processed.
+
+    min_dim: pass `None` to skip the small-image filter (use for user-pasted
+    images where intent is explicit).
     """
     if not PIL_AVAILABLE:
         # Pass through without filtering — not ideal but works.
@@ -263,7 +283,7 @@ def _normalize_image(data, mime_hint=None):
         return None
 
     w, h = img.size
-    if w < MIN_IMAGE_DIM or h < MIN_IMAGE_DIM:
+    if min_dim is not None and (w < min_dim or h < min_dim):
         return None
 
     # Convert palette/transparency to RGB for clean JPEG encoding
@@ -323,7 +343,32 @@ def _download_and_process(image_url, caption="", source_kind="web"):
 
 # ── Content fetching ───────────────────────────────────────────────────────────
 
-EMPTY_CONTENT = {"text": "", "images": []}
+EMPTY_CONTENT = {"text": "", "images": [], "title": ""}
+
+
+def _clean_title(title, max_len=200):
+    """Normalize whitespace in a title; preserve the wording verbatim.
+
+    We only collapse whitespace (multi-space / newlines → single space) and
+    apply a generous length cap as a sanity bound. NO suffix stripping —
+    the source's title is used as-is so the deck name matches the original
+    material exactly.
+    """
+    if not title:
+        return ""
+    return " ".join(title.split())[:max_len].strip()
+
+
+def _title_from_url(url):
+    """Fallback: derive a title from the URL's path."""
+    try:
+        parsed = urlparse(url)
+        last = parsed.path.rstrip("/").split("/")[-1] or parsed.netloc
+        # Strip extensions like .pdf, .html
+        last = re.sub(r"\.[a-z0-9]{2,5}$", "", last, flags=re.IGNORECASE)
+        return last.replace("-", " ").replace("_", " ").strip()[:80]
+    except Exception:
+        return ""
 
 
 def _fetch_youtube_transcript_segments(video_id):
@@ -561,89 +606,159 @@ def _curate_frames(frame_dicts, moments):
     return kept
 
 
+def _fetch_youtube_title(url):
+    """Best-effort fetch of a YouTube video's title via yt-dlp metadata-only."""
+    if not YTDLP_AVAILABLE:
+        return ""
+    try:
+        with yt_dlp.YoutubeDL({"quiet": True, "no_warnings": True, "skip_download": True}) as ydl:
+            info = ydl.extract_info(url, download=False)
+            return _clean_title((info or {}).get("title", ""))
+    except Exception:
+        return ""
+
+
 def fetch_youtube_content(url, video_id, *, progress=None):
     """Full YouTube pipeline: transcript + visual moments + curated frames.
 
-    progress: optional callable(message: str) for status updates.
+    Keeps the downloaded video file alive (callers must call cleanup_content)
+    so individual cards can be enriched with additional frames later.
+
+    Returns: {"text", "images", "warnings", "title", "_video_path",
+              "_video_tmpdir", "_segments", "_url"}
     """
     def _p(msg):
         if progress:
             try: progress(msg)
             except Exception: pass
-        print(f"      {msg}")
+        print(f"      {msg}", flush=True)
 
+    warnings = []
+    title = _fetch_youtube_title(url)
     segments = _fetch_youtube_transcript_segments(video_id)
     transcript_text = " ".join(s["text"] for s in segments)
+    base = {
+        "text": transcript_text, "images": [], "warnings": warnings,
+        "title": title,
+        "_segments": segments, "_url": url,
+    }
 
-    if not _have_ffmpeg() or not YTDLP_AVAILABLE:
-        _p("ffmpeg/yt-dlp not available — falling back to transcript only.")
-        return {"text": transcript_text, "images": []}
+    if not _have_ffmpeg():
+        warnings.append("⚠ Frame extraction skipped: ffmpeg is not installed. Install with `brew install ffmpeg`.")
+        _p(warnings[-1])
+        return base
+    if not YTDLP_AVAILABLE:
+        warnings.append("⚠ Frame extraction skipped: yt-dlp is not installed. Run `pip install yt-dlp`.")
+        _p(warnings[-1])
+        return base
 
     _p(f"Transcript: {len(segments)} segments, {len(transcript_text):,} chars.")
+    if not segments:
+        warnings.append("⚠ No transcript available — frame extraction cannot target specific moments. Try the 'Enrich with visuals' button on individual cards to pull frames anyway.")
+        _p(warnings[-1])
+        return base
+
     _p("Identifying key visual moments in the transcript…")
     try:
         moments = _pick_visual_moments(segments)
     except Exception as e:
-        _p(f"Could not identify moments ({e}). Falling back to transcript only.")
-        return {"text": transcript_text, "images": []}
+        warnings.append(f"⚠ Could not identify visual moments ({type(e).__name__}: {e})")
+        _p(warnings[-1])
+        return base
     _p(f"Found {len(moments)} candidate moment(s).")
     if not moments:
-        return {"text": transcript_text, "images": []}
+        warnings.append("⚠ No visual moments detected in the transcript (mostly verbal content?). Use 'Enrich with visuals' per-card to force extraction.")
+        _p(warnings[-1])
+        return base
 
     _p("Downloading video (low-res)…")
     try:
         video_path, tmpdir = _download_youtube_video(url)
     except Exception as e:
-        _p(f"Download failed ({e}). Falling back to transcript only.")
-        return {"text": transcript_text, "images": []}
+        warnings.append(f"⚠ Video download failed ({type(e).__name__}: {e}). The video may be private, age-restricted, or region-locked.")
+        _p(warnings[-1])
+        return base
 
+    # From here on, video is cached. Caller cleans it up via cleanup_content().
+    base["_video_path"] = video_path
+    base["_video_tmpdir"] = tmpdir
+
+    _p(f"Extracting {len(moments)} frame(s) with ffmpeg…")
+    raw_frames = []
+    for i, m in enumerate(moments):
+        frame_path = os.path.join(tmpdir, f"frame_{i:02d}.jpg")
+        try:
+            _extract_frame(video_path, m["t"], frame_path)
+        except Exception:
+            continue
+        with open(frame_path, "rb") as fh:
+            raw = fh.read()
+        normalized = _normalize_image(raw, "image/jpeg")
+        if not normalized:
+            continue
+        data, mime, ext = normalized
+        raw_frames.append({
+            "data": data, "mime": mime, "ext": ext,
+            "caption": m.get("reason", ""),
+            "source_url": url,
+            "source_kind": "youtube",
+            "_moment_idx": i,
+        })
+    _p(f"Successfully extracted {len(raw_frames)} frame(s).")
+    if not raw_frames:
+        warnings.append("⚠ ffmpeg extracted 0 usable frames. Try 'Enrich with visuals' per-card to retry.")
+        _p(warnings[-1])
+        return base
+
+    _p("Curating frames (keeping informative ones)…")
     try:
-        _p(f"Extracting {len(moments)} frame(s) with ffmpeg…")
-        raw_frames = []
-        for i, m in enumerate(moments):
-            frame_path = os.path.join(tmpdir, f"frame_{i:02d}.jpg")
-            try:
-                _extract_frame(video_path, m["t"], frame_path)
-            except Exception:
-                continue
-            with open(frame_path, "rb") as f:
-                raw = f.read()
-            normalized = _normalize_image(raw, "image/jpeg")
-            if not normalized:
-                continue
-            data, mime, ext = normalized
-            raw_frames.append({
-                "data": data, "mime": mime, "ext": ext,
-                "caption": m.get("reason", ""),
-                "source_url": url,
-                "source_kind": "youtube",
-                "_moment_idx": i,
-            })
-        _p(f"Successfully extracted {len(raw_frames)} frame(s).")
-
-        if not raw_frames:
-            return {"text": transcript_text, "images": []}
-
-        _p("Curating frames (keeping informative ones)…")
         kept_frames = _curate_frames(raw_frames, moments)
-        _p(f"Kept {len(kept_frames)} of {len(raw_frames)} frame(s).")
-        # Strip the internal _moment_idx field from each kept frame
-        for frame in kept_frames:
-            frame.pop("_moment_idx", None)
-        return {"text": transcript_text, "images": kept_frames}
-    finally:
+    except Exception as e:
+        warnings.append(f"⚠ Frame curation failed ({e}) — keeping all extracted frames.")
+        kept_frames = raw_frames
+    _p(f"Kept {len(kept_frames)} of {len(raw_frames)} frame(s).")
+    if not kept_frames:
+        warnings.append("⚠ Curation rejected all frames as uninformative (talking heads, intros, etc.). Use 'Enrich with visuals' per-card to retry with a card-specific search.")
+
+    for frame in kept_frames:
+        frame.pop("_moment_idx", None)
+    base["images"] = kept_frames
+    return base
+
+
+def cleanup_content(content):
+    """Delete any temp resources held by a content dict (e.g., cached video)."""
+    if not isinstance(content, dict):
+        return
+    tmpdir = content.get("_video_tmpdir")
+    if tmpdir and os.path.isdir(tmpdir):
         shutil.rmtree(tmpdir, ignore_errors=True)
 
 
 def fetch_web_content(url):
     """Fetch a web page: extract main text AND figures/images.
 
-    Returns: {"text": str, "images": [{...}, ...]}.
+    Returns: {"text": str, "images": [...], "title": str}.
     """
     headers = {"User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"}
     resp = requests.get(url, headers=headers, timeout=20)
     resp.raise_for_status()
     soup = BeautifulSoup(resp.text, "html.parser")
+
+    # ── Extract title BEFORE stripping nav/header (which sometimes hold it) ──
+    title = ""
+    if soup.title and soup.title.string:
+        title = _clean_title(soup.title.string)
+    if not title:
+        og_title = soup.find("meta", property="og:title")
+        if og_title and og_title.get("content"):
+            title = _clean_title(og_title["content"])
+    if not title:
+        h1 = soup.find("h1")
+        if h1:
+            title = _clean_title(h1.get_text(" ", strip=True))
+    if not title:
+        title = _title_from_url(url)
 
     for tag in soup(["script", "style", "nav", "footer", "header", "aside", "form"]):
         tag.decompose()
@@ -690,7 +805,7 @@ def fetch_web_content(url):
     text = (main or soup).get_text(separator=" ", strip=True)
     text = re.sub(r"\s+", " ", text).strip()
 
-    return {"text": text[:20000], "images": images}
+    return {"text": text[:20000], "images": images, "title": title}
 
 
 def fetch_pdf_content(url):
@@ -728,7 +843,13 @@ def fetch_pdf_from_bytes(pdf_bytes, source_label="uploaded.pdf"):
         return dict(EMPTY_CONTENT)
     if pdf_bytes[:5] != b"%PDF-":
         raise RuntimeError("Uploaded file does not look like a PDF (missing %PDF- header).")
-    return _extract_pdf_bytes(pdf_bytes)
+    out = _extract_pdf_bytes(pdf_bytes)
+    # If PDF had no usable metadata title, fall back to the filename
+    if not out.get("title"):
+        # Strip path + extension
+        name = re.sub(r"\.pdf$", "", os.path.basename(source_label or ""), flags=re.IGNORECASE)
+        out["title"] = _clean_title(name.replace("_", " ").replace("-", " "))
+    return out
 
 
 def _extract_pdf_bytes(pdf_bytes):
@@ -737,6 +858,23 @@ def _extract_pdf_bytes(pdf_bytes):
     text_parts = []
     images = []
     seen_hashes = set()
+
+    # ── Title: PDF metadata first, then first-page heuristic ──
+    title = ""
+    meta = doc.metadata or {}
+    raw_title = (meta.get("title") or "").strip()
+    # PDF metadata "title" is often garbage like "untitled1.dvi" or "Microsoft Word - ...";
+    # accept it only if it looks reasonable
+    if raw_title and len(raw_title) >= 4 and not raw_title.lower().endswith((".dvi", ".docx", ".doc")):
+        title = _clean_title(raw_title)
+    if not title and doc.page_count > 0:
+        # Heuristic: first non-trivial line of page 1, often the title
+        first_text = doc[0].get_text() or ""
+        for line in first_text.splitlines():
+            line = line.strip()
+            if len(line) >= 10 and len(line) <= 150 and not line.isupper():
+                title = _clean_title(line)
+                break
 
     for page_num, page in enumerate(doc, start=1):
         text_parts.append(page.get_text())
@@ -776,7 +914,7 @@ def _extract_pdf_bytes(pdf_bytes):
     text = "\n".join(text_parts)
     text = re.sub(r"[ \t]+", " ", text)
     text = re.sub(r"\n{3,}", "\n\n", text).strip()
-    return {"text": text[:30000], "images": images}
+    return {"text": text[:30000], "images": images, "title": title}
 
 
 def fetch_content(url, *, progress=None):
@@ -838,10 +976,19 @@ When given content from an article, paper, or video transcript — together with
 its figures and images — you produce concise, precise flashcards that follow
 the user's guidelines exactly.
 
-CRITICAL: figures and visuals carry the heaviest signal. Study them first to
-identify the core concepts the source is teaching. Then use the surrounding
-text to fill in supporting facts, definitions, and context. Cards built around
-figures should reference them via `image_ref`.
+CRITICAL — VISUALS ARE A CORE PART OF THIS TASK:
+
+1. Figures and images carry the heaviest signal. Study them FIRST and identify
+   the core concept each one teaches BEFORE looking at the text.
+2. When figures are provided, set `image_ref` AGGRESSIVELY. A card that could
+   reasonably link to a figure SHOULD link to it — the visual reinforces recall.
+   Err on the side of attaching figures, not omitting them.
+3. Use text only to (a) clarify what the figures are showing and (b) cover
+   important facts that no figure illustrates.
+4. If NO figures are provided at all, the user has been warned that visuals
+   couldn't be extracted — generate text-only cards but make them especially
+   sharp, since the user may later use the "Enrich with visuals" button to
+   attach figures per card.
 """
 
 CARD_PROMPT_TEMPLATE = """\
@@ -974,7 +1121,7 @@ def _parse_card_json(raw_text, n_images=None):
     return validate_cards(cards, n_images=n_images)
 
 
-def generate_cards(content, url, guidelines, source_kind="web"):
+def generate_cards(content, url, guidelines, source_kind="web", model=None):
     """Generate flashcards from a content dict.
 
     content: {"text": str, "images": [{"data": bytes, "mime": str, ...}]}
@@ -993,8 +1140,10 @@ def generate_cards(content, url, guidelines, source_kind="web"):
     )
 
     blocks = _build_vision_content_blocks(images, text_prompt)
+    resolved = resolve_model(model)
+    print(f"[generate_cards] model={resolved} images={len(images)} text_chars={len(text)}", flush=True)
     message = client.messages.create(
-        model="claude-opus-4-5",
+        model=resolved,
         max_tokens=8192,
         system=SYSTEM_PROMPT,
         messages=[{"role": "user", "content": blocks}],
@@ -1042,19 +1191,21 @@ Return ONLY a JSON array — no explanation, no markdown fences:
 """
 
 
-def suggest_cards(content, url, guidelines, concept, existing_cards, source_kind="web"):
-    """Generate 1–3 candidate cards for a user-supplied concept."""
-    client = anthropic.Anthropic()
-    images = content.get("images", [])
-    text = content.get("text", "")
-
+def _summarize_existing(existing_cards):
     summary_lines = []
     for c in existing_cards:
         if c.get("type") == "cloze":
             summary_lines.append(f"- (cloze) {c.get('text', '')[:120]}")
         else:
             summary_lines.append(f"- (basic) Q: {c.get('question', '')[:120]}")
-    existing_summary = "\n".join(summary_lines) or "(none yet)"
+    return "\n".join(summary_lines) or "(none yet)"
+
+
+def suggest_cards(content, url, guidelines, concept, existing_cards, source_kind="web", model=None):
+    """Generate 1–3 candidate cards for a user-supplied concept."""
+    client = anthropic.Anthropic()
+    images = content.get("images", [])
+    text = content.get("text", "")
 
     text_prompt = SUGGEST_PROMPT_TEMPLATE.format(
         url=url,
@@ -1062,18 +1213,293 @@ def suggest_cards(content, url, guidelines, concept, existing_cards, source_kind
         guidelines=guidelines or "(No custom guidelines provided.)",
         figure_instructions=_build_figure_instructions(images),
         concept=concept,
-        existing_summary=existing_summary,
+        existing_summary=_summarize_existing(existing_cards),
         content=text or "(no text extracted)",
     )
 
     blocks = _build_vision_content_blocks(images, text_prompt)
     message = client.messages.create(
-        model="claude-opus-4-5",
+        model=resolve_model(model),
         max_tokens=2048,
         system=SYSTEM_PROMPT,
         messages=[{"role": "user", "content": blocks}],
     )
     return _parse_card_json(message.content[0].text, n_images=len(images))
+
+
+REROLL_PROMPT_TEMPLATE = """\
+Source URL: {url}
+Source kind: {source_kind}
+
+# Your guidelines
+{guidelines}
+
+# How to use the figures (above)
+{figure_instructions}
+
+# Task
+The user is rerolling a single existing card — they like the topic but want a
+different angle, phrasing, or format. Generate ONE replacement card that:
+
+- Covers the same concept as the original (described below)
+- Differs meaningfully — different question framing, format (Basic vs Cloze),
+  or focus aspect of the concept
+- Doesn't duplicate any of the OTHER cards already in the draft
+- Follows the guidelines above
+
+Original card you're replacing:
+{original}
+
+Other cards in the draft (don't duplicate these):
+{existing_summary}
+
+Card formats:
+- Basic: {{"type": "basic", "question": "...", "answer": "...", "image_ref": null}}
+- Cloze: {{"type": "cloze", "text": "...", "extra": "...", "image_ref": null}}
+
+Return ONLY a single JSON object — no array, no explanation, no markdown fences:
+{{...}}
+
+# Text content
+{content}
+"""
+
+
+def _describe_card_concept(card):
+    """A natural-language description of what concept a card is testing,
+    used as a query when hunting for visuals."""
+    if card.get("type") == "cloze":
+        text = card.get("text", "")
+        extra = card.get("extra", "")
+        return f"Cloze: {text}\nContext: {extra}" if extra else f"Cloze: {text}"
+    return f"Q: {card.get('question', '')}\nA: {card.get('answer', '')}"
+
+
+def _format_transcript_indexed(segments):
+    """Render transcript segments as '[N] [mm:ss] text' for segment-picking prompts."""
+    lines = []
+    for i, s in enumerate(segments):
+        m, sec = divmod(int(s["start"]), 60)
+        h, m = divmod(m, 60)
+        ts = f"{h}:{m:02d}:{sec:02d}" if h else f"{m}:{sec:02d}"
+        lines.append(f"[{i}] [{ts}] {s['text']}")
+    return "\n".join(lines)
+
+
+ENRICH_FIND_SEGMENT_PROMPT = """\
+You're matching a flashcard to a YouTube video transcript. Each segment is
+labeled with `[N]` (its index) and `[mm:ss]` (start time).
+
+Find the SINGLE segment whose spoken content most directly discusses what
+this flashcard is testing. Whatever visual is on screen at that moment is
+what we'll attach to the card.
+
+FLASHCARD:
+{card_full}
+
+TRANSCRIPT:
+{transcript}
+
+Pick the segment where the speaker is explicitly addressing the card's
+specific concept — not generic intros, not adjacent topics, not sponsor reads.
+If the topic appears multiple times, prefer the segment where it's EXPLAINED
+(definition, mechanism, example) over where it's merely mentioned.
+
+Return ONLY a JSON object — no commentary:
+{{"segment_index": N, "reason": "tight one-sentence explanation"}}
+"""
+
+ENRICH_VISION_PICK_PROMPT = """\
+You're picking the single best visual to attach to this flashcard:
+
+CONCEPT:
+{concept}
+
+{n_frames} candidate frame(s) are above. For each, decide whether it would
+genuinely strengthen the card. Return the index of the BEST one (a single
+integer), or -1 if none are good enough.
+
+Return ONLY a JSON object — no commentary:
+{{"index": 0, "caption": "tight description of what's shown"}}
+"""
+
+
+def enrich_card_with_visuals(content, card, source_kind="web", model=None):
+    """Hunt for a visual matching this card's concept.
+
+    Returns (updated_card, new_image_or_None, message).
+    - For YouTube: re-search transcript for relevant timestamps, extract those
+      frames from the cached video, vision-pick the best, append to content.images.
+    - For PDF/web: vision-rank the existing figures and re-assign image_ref to
+      the best match. Does not extract new figures.
+    """
+    if not isinstance(card, dict):
+        return card, None, "Invalid card"
+
+    images = content.get("images", [])
+    concept = _describe_card_concept(card)
+    client = anthropic.Anthropic()
+    resolved_model = resolve_model(model)
+
+    # ── YouTube path: text-first segment match → frame at that moment ──
+    if source_kind == "youtube" and content.get("_video_path") and content.get("_segments"):
+        segments = content["_segments"]
+        video_path = content["_video_path"]
+        tmpdir = content.get("_video_tmpdir")
+        if not (video_path and os.path.exists(video_path) and tmpdir):
+            return card, None, "Video no longer cached; the draft may have expired."
+
+        # Step 1: find the SINGLE transcript segment whose spoken content
+        # most directly discusses this card.
+        card_full = _describe_card_concept(card)
+        indexed = _format_transcript_indexed(segments)[:28000]
+        match_prompt = ENRICH_FIND_SEGMENT_PROMPT.format(
+            card_full=card_full, transcript=indexed,
+        )
+        try:
+            msg = client.messages.create(
+                model=resolved_model, max_tokens=256,
+                messages=[{"role": "user", "content": match_prompt}],
+            )
+            raw = msg.content[0].text.strip()
+            raw = re.sub(r"^```(?:json)?\s*", "", raw)
+            raw = re.sub(r"\s*```$", "", raw)
+            pick = json.loads(raw)
+            seg_idx = int(pick.get("segment_index", -1))
+            reason = (pick.get("reason") or "").strip()[:200]
+        except Exception as e:
+            return card, None, f"Could not match transcript: {e}"
+
+        if not (0 <= seg_idx < len(segments)):
+            return card, None, "Couldn't find a transcript segment matching this card."
+
+        # Step 2: derive a timestamp from that segment. Use the END of the
+        # segment (plus a small offset) — speakers typically introduce a
+        # concept verbally and the visual is on screen by the time the
+        # sentence completes. This avoids the off-by-N-seconds issue of
+        # sampling at the segment start.
+        segment = segments[seg_idx]
+        next_segment = segments[seg_idx + 1] if seg_idx + 1 < len(segments) else None
+        if next_segment:
+            t = (segment["start"] + next_segment["start"]) / 2.0
+        else:
+            t = segment["start"] + 3.0  # final segment fallback
+
+        # Step 3: extract one frame at that moment
+        nonce = int(time.time() * 1000)
+        frame_path = os.path.join(tmpdir, f"enrich_{nonce}.jpg")
+        try:
+            _extract_frame(video_path, t, frame_path)
+            with open(frame_path, "rb") as fh:
+                raw_bytes = fh.read()
+        except Exception as e:
+            return card, None, f"ffmpeg failed at t={t:.1f}s: {e}"
+        normalized = _normalize_image(raw_bytes, "image/jpeg")
+        if not normalized:
+            return card, None, f"Extracted frame at t={t:.1f}s was unusable."
+        data, mime, ext = normalized
+
+        # Step 4: build the new image, append to draft, attach to card
+        m, sec = divmod(int(t), 60)
+        h, m = divmod(m, 60)
+        ts_label = f"{h}:{m:02d}:{sec:02d}" if h else f"{m}:{sec:02d}"
+        caption = f"At {ts_label} — {reason}" if reason else f"At {ts_label}"
+
+        new_image = {
+            "data": data, "mime": mime, "ext": ext,
+            "caption": caption[:300],
+            "source_url": content.get("_url", ""),
+            "source_kind": "youtube",
+        }
+        new_idx = len(images)
+        images.append(new_image)
+        content["images"] = images
+        card["image_ref"] = new_idx
+        return card, new_image, f"Matched transcript [{ts_label}]: {reason}"
+
+    # ── PDF / web path: vision-rank existing figures ──
+    if not images:
+        return card, None, "No figures available from this source to assign."
+
+    blocks = []
+    for img in images:
+        data = img.get("data")
+        if not isinstance(data, (bytes, bytearray)):
+            continue
+        blocks.append({
+            "type": "image",
+            "source": {"type": "base64", "media_type": img.get("mime", "image/jpeg"),
+                       "data": base64.b64encode(data).decode("ascii")},
+        })
+    if not blocks:
+        return card, None, "Figures are present but unusable."
+
+    blocks.append({
+        "type": "text",
+        "text": ENRICH_VISION_PICK_PROMPT.format(concept=concept, n_frames=len(blocks)),
+    })
+    try:
+        msg = client.messages.create(
+            model=resolved_model, max_tokens=512,
+            messages=[{"role": "user", "content": blocks}],
+        )
+        raw = msg.content[0].text.strip()
+        raw = re.sub(r"^```(?:json)?\s*", "", raw)
+        raw = re.sub(r"\s*```$", "", raw)
+        pick = json.loads(raw)
+    except Exception as e:
+        return card, None, f"Vision pick failed: {e}"
+
+    idx = pick.get("index", -1)
+    if not isinstance(idx, int) or idx < 0 or idx >= len(images):
+        return card, None, "No existing figure was a strong match for this card."
+
+    card["image_ref"] = idx
+    return card, None, f"Assigned Fig {idx} to this card."
+
+
+def reroll_card(content, url, guidelines, original_card, other_cards, source_kind="web", model=None):
+    """Generate one replacement card on the same concept as `original_card`."""
+    client = anthropic.Anthropic()
+    images = content.get("images", [])
+    text = content.get("text", "")
+
+    if original_card.get("type") == "cloze":
+        orig_desc = f'(cloze) text: "{original_card.get("text", "")}"'
+        if original_card.get("extra"):
+            orig_desc += f'\n  back extra: "{original_card.get("extra", "")}"'
+    else:
+        orig_desc = (
+            f'(basic) Q: "{original_card.get("question", "")}"\n'
+            f'  A: "{original_card.get("answer", "")}"'
+        )
+    if original_card.get("image_ref") is not None:
+        orig_desc += f'\n  references figure {original_card["image_ref"]}'
+
+    text_prompt = REROLL_PROMPT_TEMPLATE.format(
+        url=url,
+        source_kind=source_kind,
+        guidelines=guidelines or "(No custom guidelines provided.)",
+        figure_instructions=_build_figure_instructions(images),
+        original=orig_desc,
+        existing_summary=_summarize_existing(other_cards),
+        content=text or "(no text extracted)",
+    )
+    blocks = _build_vision_content_blocks(images, text_prompt)
+    message = client.messages.create(
+        model=resolve_model(model),
+        max_tokens=1024,
+        system=SYSTEM_PROMPT,
+        messages=[{"role": "user", "content": blocks}],
+    )
+    raw = message.content[0].text.strip()
+    raw = re.sub(r"^```(?:json)?\s*", "", raw)
+    raw = re.sub(r"\s*```$", "", raw)
+    # Reroll returns a single object, not an array
+    card = json.loads(raw)
+    if isinstance(card, list):  # be lenient if Claude returns an array
+        card = card[0] if card else None
+    return validate_card(card, n_images=len(images))
 
 
 # ── CLI ────────────────────────────────────────────────────────────────────────
