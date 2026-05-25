@@ -348,6 +348,49 @@ INDEX_HTML = r"""<!doctype html>
   .warnings ul { margin: 6px 0 0 0; padding-left: 20px; }
   .warnings li { margin: 4px 0; }
 
+  .seg-toggle {
+    display: inline-flex;
+    background: #0f1219;
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    padding: 3px;
+    gap: 2px;
+    align-self: flex-start;
+  }
+  .seg-btn {
+    background: transparent;
+    color: var(--muted);
+    border: none;
+    padding: 6px 14px;
+    font-size: 13px;
+    font-weight: 500;
+    border-radius: 6px;
+    cursor: pointer;
+    font-family: inherit;
+    transition: background 0.12s, color 0.12s;
+  }
+  .seg-btn:hover:not(.active) { color: var(--text); background: var(--panel-2); }
+  .seg-btn.active {
+    background: var(--accent);
+    color: #0a0d14;
+  }
+
+  .deck-mode-row { transition: opacity 0.15s; }
+  .deck-mode-row.inactive { opacity: 0.45; }
+
+  select#deck-existing-select {
+    width: 100%;
+    padding: 12px 14px;
+    background: #0f1219;
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    color: var(--text);
+    font-size: 15px;
+    font-family: inherit;
+    cursor: pointer;
+  }
+  select#deck-existing-select:focus { outline: none; border-color: var(--accent); }
+
   .enriched-flash {
     margin: 8px 0;
     padding: 6px 10px;
@@ -404,6 +447,37 @@ INDEX_HTML = r"""<!doctype html>
 
   <!-- Phase 2: Review -->
   <div id="phase-review" class="hidden">
+    <div class="panel" style="margin-bottom: 20px; display: flex; flex-direction: column; gap: 10px;">
+      <label>Save to deck</label>
+      <div class="seg-toggle" role="tablist">
+        <button type="button" id="mode-new-btn" class="seg-btn active" data-mode="new" role="tab">+ New deck</button>
+        <button type="button" id="mode-existing-btn" class="seg-btn" data-mode="existing" role="tab">↪ Existing deck</button>
+      </div>
+
+      <div id="deck-mode-new" class="deck-mode-row">
+        <!-- autocomplete=new-password + unusual name + data-form-type=other defeats
+             Chrome/Safari's heuristic autofill, which ignores autocomplete=off. -->
+        <input type="text"
+               id="deck-new-name"
+               name="ankigen-deck-name-xyz"
+               autocomplete="new-password"
+               autocorrect="off"
+               autocapitalize="off"
+               spellcheck="false"
+               data-lpignore="true"
+               data-form-type="other"
+               placeholder="(suggestion from source will appear here)">
+      </div>
+
+      <div id="deck-mode-existing" class="deck-mode-row">
+        <select id="deck-existing-select">
+          <option value="">— pick an existing deck —</option>
+        </select>
+      </div>
+
+      <div id="deck-merge-hint" style="font-size: 12px; color: var(--muted); min-height: 16px;"></div>
+    </div>
+
     <div id="source-info" class="source-info"></div>
     <div id="warnings-box"></div>
     <div id="figures-strip"></div>
@@ -419,25 +493,6 @@ INDEX_HTML = r"""<!doctype html>
              placeholder="Start typing — e.g. 'spacing effect', 'why retrieval works'…">
       <div id="suggest-status" style="font-size:13px; color:var(--muted); margin-top:10px; min-height:18px;"></div>
       <div id="suggestions" style="margin-top: 12px;"></div>
-    </div>
-
-    <h2>Save</h2>
-    <div class="panel" style="display: flex; flex-direction: column; gap: 8px;">
-      <label for="deck-review">Deck name <span style="text-transform: none; font-weight: 400; color: var(--muted);">(suggested from source — edit if you want)</span></label>
-      <!-- autocomplete=new-password + unusual name + data-form-type=other defeats
-           Chrome/Safari's heuristic autofill, which ignores autocomplete=off. -->
-      <input type="text"
-             id="deck-review"
-             list="decks-list"
-             name="ankigen-deck-name-xyz"
-             autocomplete="new-password"
-             autocorrect="off"
-             autocapitalize="off"
-             spellcheck="false"
-             data-lpignore="true"
-             data-form-type="other"
-             placeholder="(suggestion will appear here)">
-      <datalist id="decks-list"></datalist>
     </div>
 
     <div class="footer-actions">
@@ -461,6 +516,7 @@ let state = {
   suggestions: [],    // candidate cards from /suggest
   images: [],         // [{data_url, caption, source_kind}]
   warnings: [],
+  existingDecks: [],  // names of decks already in Anki (for merge detection)
 };
 
 // ── One-shot bootstrap: load models + decks ──────────────────────────────────
@@ -488,14 +544,68 @@ async function loadDecks() {
   try {
     const r = await fetch('/decks');
     const data = await r.json();
-    const list = $('decks-list');
-    list.innerHTML = '';
-    (data.decks || []).forEach(name => {
+    state.existingDecks = data.decks || [];
+    const sel = $('deck-existing-select');
+    sel.innerHTML = '<option value="">— pick a deck —</option>';
+    state.existingDecks.forEach(name => {
       const opt = document.createElement('option');
       opt.value = name;
-      list.appendChild(opt);
+      opt.textContent = name;
+      sel.appendChild(opt);
     });
-  } catch (e) { /* deck picker is optional; falls back to plain text input */ }
+    // If user already has no existing decks, hide the "existing" tab option entirely
+    if (!state.existingDecks.length) {
+      const btn = $('mode-existing-btn');
+      if (btn) btn.disabled = true;
+      if (btn) btn.title = 'No existing decks in Anki yet';
+    }
+  } catch (e) { /* deck picker is optional */ }
+}
+
+// Which mode is active: 'new' or 'existing'. Tracked separately from the
+// input values so switching tabs preserves what the user typed/picked.
+let deckMode = 'new';
+
+function setDeckMode(mode) {
+  deckMode = mode;
+  $('mode-new-btn').classList.toggle('active', mode === 'new');
+  $('mode-existing-btn').classList.toggle('active', mode === 'existing');
+  $('deck-mode-new').classList.toggle('inactive', mode !== 'new');
+  $('deck-mode-existing').classList.toggle('inactive', mode !== 'existing');
+  updateDeckHint();
+}
+
+function getChosenDeck() {
+  if (deckMode === 'existing') {
+    return ($('deck-existing-select').value || '').trim();
+  }
+  return ($('deck-new-name').value || '').trim();
+}
+
+function updateDeckHint() {
+  const hint = $('deck-merge-hint');
+  if (!hint) return;
+  const name = getChosenDeck();
+  if (deckMode === 'existing') {
+    if (!name) {
+      hint.textContent = 'Choose a deck from the list above.';
+      hint.style.color = 'var(--muted)';
+    } else {
+      hint.textContent = `↪ Cards will be added to "${name}"`;
+      hint.style.color = 'var(--accent)';
+    }
+  } else {
+    if (!name) {
+      hint.textContent = 'Type a name for the new deck.';
+      hint.style.color = 'var(--muted)';
+    } else if (state.existingDecks.includes(name)) {
+      hint.textContent = `↪ A deck named "${name}" already exists — cards will be merged into it`;
+      hint.style.color = 'var(--accent)';
+    } else {
+      hint.textContent = `+ A new deck "${name}" will be created`;
+      hint.style.color = 'var(--muted)';
+    }
+  }
 }
 loadModels();
 loadDecks();
@@ -774,9 +884,10 @@ $('generate-btn').addEventListener('click', async () => {
     // can race with browser form autofill on some browsers. Also re-set
     // after a microtask + a small timeout to defeat late autofill writes.
     const setDeck = () => {
-      const el = $('deck-review');
+      const el = $('deck-new-name');
       el.value = state.deck;
-      console.log('[ankigen] deck-review.value set to:', JSON.stringify(el.value));
+      setDeckMode('new');
+      console.log('[ankigen] deck-new-name.value set to:', JSON.stringify(el.value));
     };
     setDeck();
     requestAnimationFrame(setDeck);
@@ -1024,8 +1135,12 @@ $('commit-btn').addEventListener('click', async () => {
     setStatus('commit-status', 'No cards to save.', 'error');
     return;
   }
-  // Re-read the deck name in case the user edited it
-  const deckChosen = $('deck-review').value.trim() || 'AI Generated';
+  // Re-read the deck name from whichever mode is active
+  const deckChosen = getChosenDeck() || 'AI Generated';
+  if (deckMode === 'existing' && !getChosenDeck()) {
+    setStatus('commit-status', 'Please pick an existing deck, or switch to "+ New deck".', 'error');
+    return;
+  }
   state.deck = deckChosen;
   $('commit-btn').disabled = true;
   setStatus('commit-status', '<span class="spinner"></span>Saving cards and figures to Anki…', 'working');
@@ -1057,6 +1172,23 @@ $('commit-btn').addEventListener('click', async () => {
   }
 });
 
+$('mode-new-btn').addEventListener('click', () => setDeckMode('new'));
+$('mode-existing-btn').addEventListener('click', () => {
+  if ($('mode-existing-btn').disabled) return;
+  setDeckMode('existing');
+});
+// Auto-switch the active mode based on which field the user is actually using.
+$('deck-new-name').addEventListener('input', () => setDeckMode('new'));
+$('deck-new-name').addEventListener('focus', () => setDeckMode('new'));
+$('deck-existing-select').addEventListener('change', () => {
+  if ($('deck-existing-select').value) setDeckMode('existing');
+  else updateDeckHint();
+});
+$('deck-existing-select').addEventListener('focus', () => {
+  if ($('mode-existing-btn').disabled) return;
+  setDeckMode('existing');
+});
+
 $('discard-btn').addEventListener('click', () => {
   if (confirm('Discard these cards and start over?')) resetToInput();
 });
@@ -1073,7 +1205,10 @@ function resetToInput() {
   $('phase-input').classList.remove('hidden');
   $('url').value = '';
   $('concept').value = '';
-  $('deck-review').value = '';
+  $('deck-new-name').value = '';
+  $('deck-existing-select').value = '';
+  $('deck-merge-hint').textContent = '';
+  setDeckMode('new');
   $('suggestions').innerHTML = '';
   $('figures-strip').innerHTML = '';
   $('warnings-box').innerHTML = '';
